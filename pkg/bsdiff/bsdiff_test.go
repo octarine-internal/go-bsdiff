@@ -61,12 +61,12 @@ func TestReader(t *testing.T) {
 	rand.Read(file2[512:])
 	rold := bytes.NewReader(file1)
 	rnew := bytes.NewReader(file2)
-	rpatch := new(bytes.Buffer)
+	rpatch := new(util.BufWriter)
 	if err := Reader(rold, rnew, rpatch); err != nil {
 		t.Fatal(err)
 	}
 	b := make([]byte, 8)
-	rpatch.Read(b)
+	copy(b, rpatch.Bytes())
 	if !bytes.Equal(b, []byte("BSDIFF40")) {
 		t.Fail()
 	}
@@ -90,14 +90,14 @@ func TestFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t1n := tf1.Name()
-	if err := util.PutWriter(tf0, file1); err != nil {
+	if _, err = tf0.Write(file1); err != nil {
 		tf0.Close()
 		tf1.Close()
 		os.Remove(t0n)
 		os.Remove(t1n)
 		t.Fatal(err)
 	}
-	if err := util.PutWriter(tf1, file2); err != nil {
+	if _, err = tf1.Write(file2); err != nil {
 		tf0.Close()
 		tf1.Close()
 		os.Remove(t0n)

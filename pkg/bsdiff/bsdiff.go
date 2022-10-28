@@ -29,7 +29,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"os"
 
 	"github.com/dsnet/compress/bzip2"
 	"github.com/gabstv/go-bsdiff/pkg/util"
@@ -37,47 +37,50 @@ import (
 
 // Bytes takes the old and new byte slices and outputs the diff
 func Bytes(oldbs, newbs []byte) ([]byte, error) {
-	return diffb(oldbs, newbs)
+	var patch util.BufWriter
+	err := diffb(oldbs, newbs, &patch)
+	if err != nil {
+		return nil, err
+	}
+	return patch.Bytes(), nil
 }
 
 // Reader takes the old and new binaries and outputs to a stream of the diff file
-func Reader(oldbin io.Reader, newbin io.Reader, patchf io.Writer) error {
-	oldbs, err := ioutil.ReadAll(oldbin)
+func Reader(oldbin io.Reader, newbin io.Reader, patchf io.WriteSeeker) error {
+	oldbs, err := io.ReadAll(oldbin)
 	if err != nil {
 		return err
 	}
-	newbs, err := ioutil.ReadAll(newbin)
+	newbs, err := io.ReadAll(newbin)
 	if err != nil {
 		return err
 	}
-	diffbytes, err := diffb(oldbs, newbs)
-	if err != nil {
-		return err
-	}
-	return util.PutWriter(patchf, diffbytes)
+	return diffb(oldbs, newbs, patchf)
 }
 
 // File reads the old and new files to create a diff patch file
 func File(oldfile, newfile, patchfile string) error {
-	oldbs, err := ioutil.ReadFile(oldfile)
+	oldbs, err := os.ReadFile(oldfile)
 	if err != nil {
 		return fmt.Errorf("could not read oldfile '%v': %v", oldfile, err.Error())
 	}
-	newbs, err := ioutil.ReadFile(newfile)
+	newbs, err := os.ReadFile(newfile)
 	if err != nil {
 		return fmt.Errorf("could not read newfile '%v': %v", newfile, err.Error())
 	}
-	diffbytes, err := diffb(oldbs, newbs)
+	patchF, err := os.OpenFile(patchfile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("could not create patchfile '%v': %v", patchfile, err.Error())
+	}
+	err = diffb(oldbs, newbs, patchF)
+	_ = patchF.Close()
 	if err != nil {
 		return fmt.Errorf("bsdiff: %v", err.Error())
-	}
-	if err := ioutil.WriteFile(patchfile, diffbytes, 0644); err != nil {
-		return fmt.Errorf("could create patchfile '%v': %v", patchfile, err.Error())
 	}
 	return nil
 }
 
-func diffb(oldbin, newbin []byte) ([]byte, error) {
+func diffb(oldbin, newbin []byte, pf io.WriteSeeker) error {
 	bziprule := &bzip2.WriterConfig{
 		Level: bzip2.BestCompression,
 	}
@@ -86,9 +89,6 @@ func diffb(oldbin, newbin []byte) ([]byte, error) {
 
 	//var db
 	var dblen, eblen int
-
-	// create the patch file
-	pf := new(util.BufWriter)
 
 	// Header is
 	//	0	8	 "BSDIFF40"
@@ -112,12 +112,12 @@ func diffb(oldbin, newbin []byte) ([]byte, error) {
 	offtout(0, header[16:])
 	offtout(newsize, header[24:])
 	if _, err := pf.Write(header); err != nil {
-		return nil, err
+		return err
 	}
 	// Compute the differences, writing ctrl as we go
 	pfbz2, err := bzip2.NewWriter(pf, bziprule)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	var scan, ln, lastscan, lastpos, lastoffset int
 
@@ -229,18 +229,18 @@ func diffb(oldbin, newbin []byte) ([]byte, error) {
 			eblen += (scan - lenb) - (lastscan + lenf)
 
 			offtout(lenf, buf)
-			if _, err := pfbz2.Write(buf); err != nil {
-				return nil, err
+			if _, err = pfbz2.Write(buf); err != nil {
+				return err
 			}
 
 			offtout((scan-lenb)-(lastscan+lenf), buf)
-			if _, err := pfbz2.Write(buf); err != nil {
-				return nil, err
+			if _, err = pfbz2.Write(buf); err != nil {
+				return err
 			}
 
 			offtout((pos-lenb)-(lastpos+lenf), buf)
-			if _, err := pfbz2.Write(buf); err != nil {
-				return nil, err
+			if _, err = pfbz2.Write(buf); err != nil {
+				return err
 			}
 
 			lastscan = scan - lenb
@@ -249,48 +249,46 @@ func diffb(oldbin, newbin []byte) ([]byte, error) {
 		}
 	}
 	if err = pfbz2.Close(); err != nil {
-		return nil, err
+		return err
 	}
 
 	// Compute size of compressed ctrl data
-	ln = pf.Len()
-	offtout(ln-32, header[8:])
+	offtout(int(pfbz2.OutputOffset), header[8:])
 
 	// Write compressed diff data
 	pfbz2, err = bzip2.NewWriter(pf, bziprule)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if _, err = pfbz2.Write(db[:dblen]); err != nil {
-		return nil, err
+		return err
 	}
 
 	if err = pfbz2.Close(); err != nil {
-		return nil, err
+		return err
 	}
 	// Compute size of compressed diff data
-	newsize = pf.Len()
-	offtout(newsize-ln, header[16:])
+	offtout(int(pfbz2.OutputOffset), header[16:])
 	// Write compressed extra data
 	pfbz2, err = bzip2.NewWriter(pf, bziprule)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if _, err = pfbz2.Write(eb[:eblen]); err != nil {
-		return nil, err
+		return err
 	}
 	if err = pfbz2.Close(); err != nil {
-		return nil, err
+		return err
 	}
 	// Seek to the beginning, write the header, and close the file
 	if _, err = pf.Seek(0, io.SeekStart); err != nil {
-		return nil, err
+		return err
 	}
 	if _, err = pf.Write(header); err != nil {
-		return nil, err
+		return err
 	}
 
-	return pf.Bytes(), nil
+	return nil
 }
 
 func search(iii []int, oldbin []byte, newbin []byte, st, en int, pos *int) int {
@@ -311,7 +309,10 @@ func search(iii []int, oldbin []byte, newbin []byte, st, en int, pos *int) int {
 	}
 
 	x = st + (en-st)/2
-	cmpln := util.Min(oldsize-iii[x], newsize)
+	cmpln := oldsize - iii[x]
+	if cmpln > newsize {
+		cmpln = newsize
+	}
 	if bytes.Compare(oldbin[iii[x]:iii[x]+cmpln], newbin[:cmpln]) < 0 {
 		return search(iii, oldbin, newbin, x, en, pos)
 	}

@@ -29,7 +29,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"os"
 
 	"github.com/dsnet/compress/bzip2"
 	"github.com/gabstv/go-bsdiff/pkg/util"
@@ -37,56 +37,52 @@ import (
 
 // Bytes applies a patch with the oldfile to create the newfile
 func Bytes(oldfile, patch []byte) (newfile []byte, err error) {
-	return patchb(oldfile, patch)
+	var buf util.BufWriter
+	err = patchb(bytes.NewReader(oldfile), bytes.NewReader(patch), &buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // Reader applies a BSDIFF4 patch (using oldbin and patchf) to create the newbin
-func Reader(oldbin io.Reader, newbin io.Writer, patchf io.Reader) error {
-	oldbs, err := ioutil.ReadAll(oldbin)
-	if err != nil {
-		return err
-	}
-	diffbytes, err := ioutil.ReadAll(patchf)
-	if err != nil {
-		return err
-	}
-	newbs, err := patchb(oldbs, diffbytes)
-	if err != nil {
-		return err
-	}
-	return util.PutWriter(newbin, newbs)
+func Reader(oldfile io.ReaderAt, newfile io.WriterAt, patch io.ReaderAt) error {
+	return patchb(oldfile, patch, newfile)
 }
 
 // File applies a BSDIFF4 patch (using oldfile and patchfile) to create the newfile
 func File(oldfile, newfile, patchfile string) error {
-	oldbs, err := ioutil.ReadFile(oldfile)
+	oldF, err := os.Open(oldfile)
 	if err != nil {
-		return fmt.Errorf("could not read oldfile '%v': %v", oldfile, err.Error())
+		return fmt.Errorf("could not open oldfile '%v': %v", oldfile, err.Error())
 	}
-	patchbs, err := ioutil.ReadFile(patchfile)
+	defer oldF.Close()
+	patchF, err := os.Open(patchfile)
 	if err != nil {
-		return fmt.Errorf("could not read patchfile '%v': %v", patchfile, err.Error())
+		return fmt.Errorf("could not open patchfile '%v': %v", patchfile, err.Error())
 	}
-	newbytes, err := patchb(oldbs, patchbs)
+	defer patchF.Close()
+	newF, err := os.OpenFile(newfile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
-		return fmt.Errorf("bspatch: %v", err.Error())
-	}
-	if err := ioutil.WriteFile(newfile, newbytes, 0644); err != nil {
 		return fmt.Errorf("could not create newfile '%v': %v", newfile, err.Error())
+	}
+	err = patchb(oldF, patchF, newF)
+	_ = newF.Close()
+	if err != nil {
+		os.Remove(newfile)
+		return fmt.Errorf("bspatch: %v", err.Error())
 	}
 	return nil
 }
 
-func patchb(oldfile, patch []byte) ([]byte, error) {
-	oldsize := len(oldfile)
+func patchb(oldfile io.ReaderAt, patch io.ReaderAt, res io.WriterAt) error {
 	var newsize int
 	header := make([]byte, 32)
 	buf := make([]byte, 8)
-	var lenread int
 	var i int
 	ctrl := make([]int, 3)
 
-	f := bytes.NewReader(patch)
+	f := io.NewSectionReader(patch, 0, int64(len(header)))
 
 	//	File format:
 	//		0	8	"BSDIFF40"
@@ -103,13 +99,13 @@ func patchb(oldfile, patch []byte) ([]byte, error) {
 	// Read header
 	if n, err := f.Read(header); err != nil || n < 32 {
 		if err != nil {
-			return nil, fmt.Errorf("corrupt patch %v", err.Error())
+			return fmt.Errorf("corrupt patch %v", err.Error())
 		}
-		return nil, fmt.Errorf("corrupt patch (n %v < 32)", n)
+		return fmt.Errorf("corrupt patch (n %v < 32)", n)
 	}
 	// Check for appropriate magic
 	if bytes.Compare(header[:8], []byte("BSDIFF40")) != 0 {
-		return nil, fmt.Errorf("corrupt patch (header BSDIFF40)")
+		return fmt.Errorf("corrupt patch (header BSDIFF40)")
 	}
 
 	// Read lengths from header
@@ -118,119 +114,124 @@ func patchb(oldfile, patch []byte) ([]byte, error) {
 	newsize = offtin(header[24:])
 
 	if bzctrllen < 0 || bzdatalen < 0 || newsize < 0 {
-		return nil, fmt.Errorf("corrupt patch (bzctrllen %v bzdatalen %v newsize %v)", bzctrllen, bzdatalen, newsize)
+		return fmt.Errorf("corrupt patch (bzctrllen %v bzdatalen %v newsize %v)", bzctrllen, bzdatalen, newsize)
 	}
 
 	// Close patch file and re-open it via libbzip2 at the right places
 	f = nil
-	cpf := bytes.NewReader(patch)
-	if _, err := cpf.Seek(32, io.SeekStart); err != nil {
-		return nil, err
-	}
-	cpfbz2, err := bzip2.NewReader(cpf, nil)
+	cpfbz2, err := bzip2.NewReader(io.NewSectionReader(patch, 32, int64(bzctrllen)), nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	dpf := bytes.NewReader(patch)
-	if _, err := dpf.Seek(int64(32+bzctrllen), io.SeekStart); err != nil {
-		return nil, err
-	}
-	dpfbz2, err := bzip2.NewReader(dpf, nil)
+	dpfbz2, err := bzip2.NewReader(io.NewSectionReader(patch, int64(32+bzctrllen), int64(bzdatalen)), nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	epf := bytes.NewReader(patch)
-	if _, err := epf.Seek(int64(32+bzctrllen+bzdatalen), io.SeekStart); err != nil {
-		return nil, err
-	}
-	epfbz2, err := bzip2.NewReader(epf, nil)
+	epfbz2, err := bzip2.NewReader(io.NewSectionReader(patch, int64(32+bzctrllen+bzdatalen), 1<<31), nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	pnew := make([]byte, newsize)
+	// Preallocate required space
+	if _, err = res.WriteAt([]byte{0}, int64(newsize-1)); err != nil {
+		return err
+	}
 
-	oldpos := 0
+	const readBufSize = 4096
+	var readBuf, readBufPatch [readBufSize]byte
 	newpos := 0
+	oldpos := 0
 
 	for newpos < newsize {
 		// Read control data
 		for i = 0; i <= 2; i++ {
-			lenread, err = zreadall(cpfbz2, buf, 8)
-			if lenread != 8 || (err != nil && err != io.EOF) {
+			lenread, err := io.ReadFull(cpfbz2, buf)
+			if err != nil && err != io.EOF {
 				e0 := ""
 				if err != nil {
 					e0 = err.Error()
 				}
-				return nil, fmt.Errorf("corrupt patch or bzstream ended: %s (read: %v/8)", e0, lenread)
+				return fmt.Errorf("corrupt patch or bzstream ended: %s (read: %v/8)", e0, lenread)
 			}
 			ctrl[i] = offtin(buf)
 		}
 		// Sanity-check
 		if newpos+ctrl[0] > newsize {
-			return nil, fmt.Errorf("corrupt patch (sanity check)")
+			return fmt.Errorf("corrupt patch (sanity check)")
 		}
 
-		// Read diff string
-		// lenread, err = dpfbz2.Read(pnew[newpos : newpos+ctrl[0]])
-		lenread, err = zreadall(dpfbz2, pnew[newpos:newpos+ctrl[0]], ctrl[0])
-		if lenread < ctrl[0] || (err != nil && err != io.EOF) {
-			e0 := ""
-			if err != nil {
-				e0 = err.Error()
+		for i = 0; i < ctrl[0]; i += readBufSize {
+			readSize := ctrl[0] - i
+			if readSize > readBufSize {
+				readSize = readBufSize
 			}
-			return nil, fmt.Errorf("corrupt patch or bzstream ended (2): %s", e0)
-		}
-		// Add pold data to diff string
-		for i = 0; i < ctrl[0]; i++ {
-			if oldpos+i >= 0 && oldpos+i < oldsize {
-				pnew[newpos+i] += oldfile[oldpos+i]
-			}
-		}
 
-		// Adjust pointers
-		newpos += ctrl[0]
-		oldpos += ctrl[0]
+			// Read diff string
+			// lenread, err = dpfbz2.Read(pnew[newpos : newpos+ctrl[0]])
+			_, err = io.ReadFull(dpfbz2, readBufPatch[:readSize])
+			if err != nil && err != io.EOF {
+				e0 := ""
+				if err != nil {
+					e0 = err.Error()
+				}
+				return fmt.Errorf("corrupt patch or bzstream ended (2): %s", e0)
+			}
+
+			// Add pold data to diff string
+			n, _ := oldfile.ReadAt(readBuf[:readSize], int64(oldpos))
+			for j := 0; j < n; j++ {
+				readBufPatch[j] += readBuf[j]
+			}
+
+			if _, err = res.WriteAt(readBufPatch[:readSize], int64(newpos)); err != nil {
+				return err
+			}
+			newpos += readSize
+			oldpos += readSize
+		}
 
 		// Sanity-check
 		if newpos+ctrl[1] > newsize {
-			return nil, fmt.Errorf("corrupt patch newpos+ctrl[1] newsize")
+			return fmt.Errorf("corrupt patch newpos+ctrl[1] newsize")
 		}
 
 		// Read extra string
 		// epfbz2.Read was not reading all the requested bytes, probably an internal buffer limitation ?
 		// it was encapsulated by zreadall to work around the issue
-		lenread, err = zreadall(epfbz2, pnew[newpos:newpos+ctrl[1]], ctrl[1])
-		if lenread < ctrl[1] || (err != nil && err != io.EOF) {
-			e0 := ""
-			if err != nil {
-				e0 = err.Error()
+		for i = 0; i < ctrl[1]; i += readBufSize {
+			readSize := ctrl[1] - i
+			if readSize > readBufSize {
+				readSize = readBufSize
 			}
-			return nil, fmt.Errorf("corrupt patch or bzstream ended (3): %s", e0)
+			if _, err = io.ReadFull(epfbz2, readBuf[:readSize]); err != nil && err != io.EOF {
+				e0 := ""
+				if err != nil {
+					e0 = err.Error()
+				}
+				return fmt.Errorf("corrupt patch or bzstream ended (3): %s", e0)
+			}
+			if _, err = res.WriteAt(readBuf[:readSize], int64(newpos)); err != nil {
+				return err
+			}
+			newpos += readSize
+			oldpos += readSize
 		}
 		// Adjust pointers
-		newpos += ctrl[1]
-		oldpos += ctrl[2]
+		oldpos += ctrl[2] - ctrl[1]
 	}
 
 	// Clean up the bzip2 reads
 	if err = cpfbz2.Close(); err != nil {
-		return nil, err
+		return err
 	}
 	if err = dpfbz2.Close(); err != nil {
-		return nil, err
+		return err
 	}
 	if err = epfbz2.Close(); err != nil {
-		return nil, err
+		return err
 	}
-	cpfbz2 = nil
-	dpfbz2 = nil
-	epfbz2 = nil
-	cpf = nil
-	dpf = nil
-	epf = nil
 
-	return pnew, nil
+	return nil
 }
 
 // offtin reads an int64 (little endian)
@@ -256,23 +257,4 @@ func offtin(buf []byte) int {
 		y = -y
 	}
 	return y
-}
-
-func zreadall(r io.Reader, b []byte, expected int) (int, error) {
-	var allread int
-	var offset int
-	for {
-		nread, err := r.Read(b[offset:])
-		if nread == expected {
-			return nread, err
-		}
-		if err != nil {
-			return allread + nread, err
-		}
-		allread += nread
-		if allread >= expected {
-			return allread, nil
-		}
-		offset += nread
-	}
 }

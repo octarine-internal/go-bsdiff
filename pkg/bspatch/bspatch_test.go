@@ -95,12 +95,12 @@ func TestReader(t *testing.T) {
 	}
 	oldrdr := bytes.NewReader(oldfile)
 	prdr := bytes.NewReader(patchfile)
-	newf := new(bytes.Buffer)
+	newf := new(util.BufWriter)
 	if err := Reader(oldrdr, newf, prdr); err != nil {
 		t.Fatal(err)
 	}
 	buf := make([]byte, 8)
-	newf.Read(buf)
+	copy(buf, newf.Bytes())
 	if !bytes.Equal(buf, []byte{0x66, 0xFF, 0xD1, 0x55, 0x56, 0x10, 0x30, 0x00}) {
 		t.Fatal(buf)
 	}
@@ -143,14 +143,14 @@ func TestFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t1n := tf1.Name()
-	if err := util.PutWriter(tf0, oldfile); err != nil {
+	if _, err = tf0.Write(oldfile); err != nil {
 		tf0.Close()
 		tf1.Close()
 		os.Remove(t0n)
 		os.Remove(t1n)
 		t.Fatal(err)
 	}
-	if err := util.PutWriter(tf1, patchfile); err != nil {
+	if _, err = tf1.Write(patchfile); err != nil {
 		tf0.Close()
 		tf1.Close()
 		os.Remove(t0n)
@@ -206,14 +206,14 @@ func TestFileErr(t *testing.T) {
 
 type corruptReader int
 
-func (r *corruptReader) Read(p []byte) (n int, err error) {
+func (r *corruptReader) ReadAt(p []byte, off int64) (n int, err error) {
 	return 0, fmt.Errorf("testing")
 }
 
 func TestReaderError(t *testing.T) {
 	cr := corruptReader(0)
 	b0 := bytes.NewReader([]byte{0, 0, 0, 0, 0, 1, 2, 3, 4, 5})
-	b1 := new(bytes.Buffer)
+	b1 := new(util.BufWriter)
 	if err := Reader(&cr, b1, b0); err == nil {
 		t.Fail()
 	}
@@ -252,45 +252,5 @@ func TestCorruptHeader(t *testing.T) {
 	}
 	if err.Error()[:15] != "corrupt patch (" {
 		t.Fatal("header should be corrupt (6)")
-	}
-}
-
-type lowcaprdr struct {
-	read []byte
-	n    int
-}
-
-func (r *lowcaprdr) Read(b []byte) (int, error) {
-	if len(b) > 8 {
-		copy(r.read[r.n:], b[:8])
-		r.n += 8
-		return 8, nil
-	}
-	copy(r.read[r.n:], b)
-	r.n += len(b)
-	return len(b), nil
-}
-
-func TestZReadAll(t *testing.T) {
-	buf := []byte{
-		0x10, 0x10, 0x10, 0x10, 0x20, 0x20, 0x20, 0x20,
-		0x30, 0x30, 0x30, 0x30, 0x40, 0x40, 0x40, 0x40,
-		0x43,
-	}
-	rr := &lowcaprdr{
-		read: make([]byte, 1024),
-	}
-	nr, err := zreadall(rr, buf, len(buf))
-	if err != nil {
-		t.Fail()
-	}
-	if nr != len(buf) {
-		t.Fail()
-	}
-	if buf[16] != rr.read[16] {
-		t.Fail()
-	}
-	if buf[7] != rr.read[7] {
-		t.Fail()
 	}
 }
