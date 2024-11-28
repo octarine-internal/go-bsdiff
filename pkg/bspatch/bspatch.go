@@ -137,7 +137,7 @@ func patchb(oldfile io.ReaderAt, patch io.ReaderAt, res io.WriterAt) error {
 		return err
 	}
 
-	const readBufSize = 4096
+	const readBufSize = 64 * 1024
 	var readBuf, readBufPatch [readBufSize]byte
 	newpos := 0
 	oldpos := 0
